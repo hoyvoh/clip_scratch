@@ -3,65 +3,64 @@ import random
 
 '''
 RDML:
-- Init M as identity matrix
-- for each step, take in xi, xj and yij is always  1
-- for img xi, take n-3 xk for k not j  from the list of captions then update yij in this case is always -1
-- for each pair of xi, xj, calculate loss and yield return loss for update
-- New M updated using the formula based on xi, xj, yij
-- Lambda: trade off rate
-- setup the dataset so that 1 img has 3 to 5 keywords and no duplicate,
-then, for each keyword, pair with img not its class with a sign -1
+Data: sample data in 2 ways: 
+> Positive: img - title - signal = 1
+> Negarive: img - title - signal = -1 x 5
+
+- M is initialized as identity
+- learning rate = 1e-4
+- projector to PSD only for M
 
 
 '''
-torch.autograd.set_detect_anomaly(True)
 
 
 def prepare_rdml_data(df):
-    cols = ['id', 'img_path', 'keywords']
+    cols = ['id', 'img_path', 'name','keywords']
     df = df[cols]
     img_paths = []
-    kws = []
+    keywords = []
+    names = []
     pids = []
     signals = []
-
-    all_keywords = []
-    for keywords in df['keywords']:
-        keywords = keywords.split('-')
-        keywords = [kw for kws in keywords for kw in kws.split('[SEP]') if not re.search(r'<[^>]+>', kw)]
-        all_keywords.extend(keywords)
-
-    for _, row in df.iterrows():
-        keywords = row.get('keywords')
-        path = row.get('img_path')
-        pid = row.get('id')
-        keywords = keywords.split('-')
-        keywords = [kw for kws in keywords for kw in kws.split('[SEP]') if not re.search(r'<[^>]+>', kw)]
-
-        # Positive samples
-        for kw in keywords:
-            kws.append(kw)
-            img_paths.append(path)
-            pids.append(pid)
-            signals.append(1.0)  # Positive signal
-
-        # Negative samples
-        for kw in random.sample(all_keywords, len(keywords)):
-            if kw not in keywords:
-                kws.append(kw)
-                img_paths.append(path)
-                pids.append(pid)
-                signals.append(-1.0)  # Negative signal
-
-    return img_paths, kws, pids, signals
+    negative_labels = df['name'].tolist()
     
+    for _, row in df.iterrows():
+        name = viettext_processing.vietnamese_preprocessing(row.get('name'))
+        
+        # positive line
+        img_paths.append(row.get('img_path'))
+        names.append(name)
+        keywords.append(row.get('keywords'))
+        pids.append(row.get('id'))
+        signals.append(1.0)
+
+        # negative lines
+        dup_mems = set(name.split(' '))
+        available_subset = [
+            label for label in negative_labels
+            if label != name and not dup_mems.intersection(label.lower().split())
+        ]
+        if len(available_subset) >3:
+            sampled_products = random.sample(available_subset, 3)
+        else:
+            sampled_products = available_subset
+        for neg in sampled_products:
+            img_paths.append(row.get('img_path'))
+            names.append(neg)
+            keywords.append(row.get('keywords'))
+            pids.append(row.get('id'))
+            signals.append(-1.0)
+    return img_paths, names, pids, keywords, signals
+
 
 def make_rdml_train():
     df = pd.read_csv('data/pdata/sample_imgs.csv')
-    img_paths, keywords, pids, signals = prepare_rdml_data(df)
+    img_paths, names, pids, keywords, signals = prepare_rdml_data(df)
     dataset_df = pd.DataFrame({
         'pids':pids,
         'img_paths':img_paths,
+        'names': names,
         'keywords':keywords,
         'signals':signals
     })
@@ -95,12 +94,12 @@ def make_rdml_train():
 
 
 class CLIP_RDML_Dataset(torch.utils.data.Dataset):
-    def __init__(self, img_paths, keywords, signals, tokenizer, transforms):
+    def __init__(self, img_paths, names, signals, tokenizer, transforms):
         self.img_paths = img_paths
-        self.keywords = list(keywords)
+        self.names = list(names)
         self.signals = list(signals)
         self.encoded_keywords = tokenizer(
-            self.keywords, 
+            self.names, 
             padding=True,
             truncation=True,
             max_length=clip_helper.CFG.max_length,
@@ -119,12 +118,12 @@ class CLIP_RDML_Dataset(torch.utils.data.Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = self.transforms(image=image)['image']
         item['image'] = item['image'] = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
-        item['caption'] = self.keywords[idx]
+        item['caption'] = self.names[idx]
         item['signal'] = self.signals[idx]
         return item
     
     def __len__(self):
-        return len(self.keywords)
+        return len(self.names)
         
 
 def build_RDML_loader(dataframe, tokenizer, mode):
@@ -135,7 +134,7 @@ def build_RDML_loader(dataframe, tokenizer, mode):
     
     dataset = CLIP_RDML_Dataset(
         img_paths=dataframe['img_paths'].values,
-        keywords=dataframe['keywords'].values,
+        names=dataframe['names'].values,
         signals=dataframe['signals'].values,
         tokenizer=tokenizer,
         transforms=transforms
@@ -161,6 +160,8 @@ def cosine_similarity(x, y):
     similarity = x1 @ y1.T
     return similarity
 
+torch.autograd.set_detect_anomaly(True)
+
 class CLIP_RDML_Model(CLIPModel):
     def __init__(
             self,
@@ -180,22 +181,28 @@ class CLIP_RDML_Model(CLIPModel):
 
     def mahalanobis_similarity(self, x1, x2):
         diff = x1 - x2
-        distance = torch.sqrt(torch.matmul(torch.matmul(diff, self.mahalanobis_matrix), diff.T))
+        distance = torch.sqrt(torch.clamp(torch.matmul(torch.matmul(diff, self.mahalanobis_matrix), diff.T), min=1e-6, max=1e3))
         similarity = 1 / (1 + distance)
         return similarity
 
     def update_matrix(self, x1, x2, y):
         diff = x1 - x2
-        #y_expanded = y.unsqueeze(1).expand_as(diff)
-        weighted_loss_matrix = torch.matmul(y.to(torch.float),torch.matmul(diff, diff.T))
-        weighted_loss = self.model_lambda * torch.sum(weighted_loss_matrix)
-        self.mahalanobis_matrix = self.mahalanobis_matrix - weighted_loss
-        self.mahalanobis_matrix = self.project_to_psd(self.mahalanobis_matrix)
+        y = y.to(torch.float)
+        weighted_loss_matrix = torch.clamp(torch.matmul(y, torch.matmul(diff, diff.T)), min=1e-6, max=1e2)
+        new_matrix = self.mahalanobis_matrix - self.model_lambda * weighted_loss_matrix.mean(dim=0)
+        # regularization
+        epsilon = 1e-6
+        new_matrix += epsilon * torch.eye(new_matrix.size(0), device=new_matrix.device)
+
+        self.mahalanobis_matrix = self.project_to_psd(new_matrix)
 
     def project_to_psd(self, matrix):
+        print(matrix)
         eigvals, eigvecs = torch.linalg.eigh(matrix)
-        eigvals = torch.clamp(eigvals, min=0)
-        return eigvecs @ torch.diag(eigvals) @ eigvecs.T
+        eigvals = torch.clamp(eigvals, min=1e-6)
+        psd_matrix = torch.clamp(eigvecs @ torch.diag(eigvals) @ eigvecs.T, min=1e-6, max=1e2)
+        print(psd_matrix)
+        return psd_matrix
 
     def forward(self, batch):
         image_features = self.image_encoder(batch['image'])
@@ -203,29 +210,52 @@ class CLIP_RDML_Model(CLIPModel):
             input_ids=batch['input_ids'], attention_mask=batch["attention_mask"]
         )
         signals = batch['signal']
+        print('signal:', signals.shape)
 
         image_embeddings = self.image_projection(image_features)
         text_embeddings = self.text_projection(text_features)
+        print('----------------')
+        print('img:', image_embeddings.shape)
+        print('text:', text_embeddings.shape)        
+        print('----------------')
 
         # Calculate similarities
         img_text_similarity = self.mahalanobis_similarity(image_embeddings, text_embeddings)
         text_text_similarity = self.mahalanobis_similarity(text_embeddings, text_embeddings)
         img_img_similarity = self.mahalanobis_similarity(image_embeddings, image_embeddings)
-
+        print('----------------')
+        print('img-text:', img_text_similarity.shape)
+        print('img-img:', img_img_similarity.shape)
+        print('text-text:', text_text_similarity.shape)
+        print('----------------')
         # Targets
-        targets = (img_img_similarity + text_text_similarity) / 2 * self.temperature
-
+        targets = torch.clamp((img_img_similarity + text_text_similarity) / 2 * self.temperature, min=1e-6, max=1e3)
+        print('----------------')
+        print('targets', targets)
+        print('----------------')
         # Calculate logits
-        logits = img_text_similarity / self.temperature
+        logits = torch.clamp(img_text_similarity / self.temperature, min=1e-6, max=1e3)
+        print('----------------')
+        print('logits', logits)
+        print('----------------')
 
+        self.update_matrix(image_embeddings, text_embeddings, signals)
+        signals = torch.tensor(signals)
+        signals[signals == -1] = 0
+        
         # Loss calculation
         texts_loss = F.cross_entropy(logits, targets, reduction='none') * signals
         images_loss = F.cross_entropy(logits.T, targets.T, reduction='none') * signals
-
         loss = (images_loss.mean() + texts_loss.mean()) / 2
 
+        print('----------------')
+        print('text loss', texts_loss)
+        print('img loss', images_loss)
+        print('loss', loss)
+        print('----------------')
+
         # Update Mahalanobis matrix
-        self.update_matrix(image_embeddings, text_embeddings, signals)
+        
         print(loss)
 
         return loss
@@ -301,6 +331,16 @@ def test_rdml(ds_df):
         'img_embeddings':list(img_embeddings),
         'text_embeddings':list(text_embeddings)
     })
+
+    pc_client.upsert_namespace(
+        text_embeddings=list(text_embeddings), 
+        image_embeddings=list(img_embeddings),
+        pids=ds_df['pids'].tolist(),
+        metadata=ds_df['keywords'].tolist(),
+        namespace='rdmlCLIP'
+    )
+    pc_client.namespace_details(namespace='rdmlCLIP')
+
     df_img.to_csv('embeddings/clip_img_embedding_rdml.csv', encoding='utf-8', index=False)
 
 def main_rdml():

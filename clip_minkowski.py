@@ -16,14 +16,33 @@ def cosine_similarity(x, y):
     similarity = torch.abs(x1 @ y1.T)
     return similarity
 
-class CLIP_RDF_Model(CLIPModel):
+def euclid_distance(x, y):
+    return torch.sqrt(torch.sum((x - y) ** 2))
+
+# # no
+# def minkowski_distance(x, y):
+#     if x.shape != y.shape:
+#         raise ValueError("Vectors must have the same length")
+#     return torch.sum(x != y).item()
+
+
+def minkowski_distance(x, y, p=1):
+    if x.shape != y.shape:
+        raise ValueError("Vectors must have the same length")
+    if p <= 0 or p > 2:
+        p = 1
+    distance = torch.sum(torch.abs(x - y) ** p, dim=1, keepdim=True).pow(1/p)
+    distance_matrix = torch.diag(distance)
+    return distance_matrix
+
+
+class CLIP_minkowski_Model(CLIPModel):
     def __init__(
             self,
             temperature = clip_helper.CFG.temperature,
             image_embedding=clip_helper.CFG.image_embedding,
             text_embedding=clip_helper.CFG.text_embedding,
-            margin=0.2,
-            beta=0.5
+            
     ):
         super().__init__()
         self.image_encoder = ImageEncoder()
@@ -31,8 +50,7 @@ class CLIP_RDF_Model(CLIPModel):
         self.image_projection = ProjectionHead(embedding_dim=image_embedding)
         self.text_projection = ProjectionHead(embedding_dim=text_embedding)
         self.temperature = temperature
-        self.margin = margin
-        self.beta = beta
+        
 
     def forward(self, batch):
         image_features = self.image_encoder(batch['image'])
@@ -49,17 +67,17 @@ class CLIP_RDF_Model(CLIPModel):
         - 
         
         '''
-        logits = cosine_similarity(text_embeddings, image_embeddings)/self.temperature - self.margin
-        text_similarity = cosine_similarity(text_embeddings, text_embeddings)
-        image_similarity = cosine_similarity(image_embeddings, image_embeddings)
-        targets = (image_similarity + text_similarity)/2*self.temperature
-        texts_loss = cross_entropy(logits, targets, reduction='none') * self.beta
-        images_loss = cross_entropy(logits.T, targets.T, reduction='none') * self.beta
+        logits = F.softmax(minkowski_distance(text_embeddings, image_embeddings)/self.temperature, dim=-1)
+        text_distance = minkowski_distance(text_embeddings, text_embeddings)
+        image_distance = minkowski_distance(image_embeddings, image_embeddings)
+        targets = F.softmax((image_distance + text_distance)/2*self.temperature, dim=-1)
+        texts_loss = F.mse_loss(logits, targets, reduction='none')
+        images_loss = F.mse_loss(logits.T, targets.T, reduction='none')
         loss = (images_loss + texts_loss)/2
         return loss.mean()
 
 
-def train_rdf(train_df, valid_df):
+def train_minkowski(train_df, valid_df):
     tokenizer = DistilBertTokenizer.from_pretrained(clip_helper.CFG.text_tokenizer)
     print('===========')
     print('Train loader initializing...')
@@ -76,7 +94,7 @@ def train_rdf(train_df, valid_df):
     print('\n===========')
     print('CLIP model initializing...')
     print('===========\n')
-    model = CLIP_RDF_Model().to(clip_helper.CFG.device)
+    model = CLIP_minkowski_Model().to(clip_helper.CFG.device)
     
     print('\n===========')
     print('CLIP params initializing...')
@@ -112,14 +130,14 @@ def train_rdf(train_df, valid_df):
         
         if valid_loss.avg < best_loss:
             best_loss = valid_loss.avg
-            torch.save(model.state_dict(), "model/best_rfd.pt")
+            torch.save(model.state_dict(), "model/best_minkowski.pt")
             print("Saved Best Model!")
         
         lr_scheduler.step(valid_loss.avg)
 
 
-def test_rfd(ds_df):
-    _, img_embeddings, text_embeddings = get_image_embeddings(ds_df, 'model/best_rfd.pt')
+def test_minkowski(ds_df):
+    _, img_embeddings, text_embeddings = get_image_embeddings(ds_df, 'model/best_minkowski.pt')
     print(img_embeddings.shape)
     print(text_embeddings.shape)
 
@@ -136,17 +154,17 @@ def test_rfd(ds_df):
         image_embeddings=list(img_embeddings),
         pids=ds_df['pids'].tolist(),
         metadata=ds_df['keywords'].tolist(),
-        namespace='rdfCLIP'
+        namespace='minkowskiCLIP'
     )
-    pc_client.namespace_details(namespace='rdfCLIP')
+    pc_client.namespace_details(namespace='minkowskiCLIP')
 
-    df_img.to_csv('embeddings/clip_img_embedding_rfd.csv', encoding='utf-8', index=False)
+    df_img.to_csv('embeddings/clip_img_embedding_minkowski.csv', encoding='utf-8', index=False)
 
 def main_rdf():
     df, train_df, valid_df = make_train_dfs()
     print(df)
-    #train_rdf(train_df, valid_df)
-    test_rfd(df)
+    train_minkowski(train_df, valid_df)
+    test_minkowski(df)
 
     
 

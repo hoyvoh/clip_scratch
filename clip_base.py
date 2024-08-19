@@ -3,7 +3,6 @@ import ast
 import re
 import torch.utils
 import torch.utils.data
-# import clip_helper
 import cv2
 import torch
 import albumentations as A
@@ -12,11 +11,12 @@ import timm
 from transformers import DistilBertModel, DistilBertConfig, DistilBertTokenizer
 import torch.nn.functional as F
 from tqdm import tqdm
-# from viettext_processing import vietnamese_preprocessing
 import itertools
 import clip_helper
 import viettext_processing
 import numpy as np
+from pinecone_usdef import *
+from random import sample
 
 # title - img
 class CLIPDataset(torch.utils.data.Dataset):
@@ -191,21 +191,23 @@ def extract_values_from_string(string_data):
 
     
 def prepare_data(data):
-    cols = ['id', 'img_path', 'name']
+    cols = ['id', 'img_path', 'name', 'keywords']
     data = data[cols]
     img_paths = []
+    names = []
     keywords = []
     pids = []
-    unique_entries = set()  # Set to track unique entries
+    # unique_entries = set()  # Set to track unique entries
 
     for pair in data.iterrows():
         pair = dict(pair[1])
         name = viettext_processing.vietnamese_preprocessing(pair.get('name'))
         img_paths.append(pair.get('img_path'))
-        keywords.append(name)
+        names.append(name)
+        keywords.append(pair.get('keywords'))
         pids.append(pair.get('id'))
             
-    return img_paths, keywords, pids
+    return img_paths, names, pids, keywords
 
 import regex as re
 
@@ -230,11 +232,12 @@ def prepare_data2(df):
 
 def make_train_dfs():
     df = pd.read_csv('data/pdata/sample_imgs.csv')
-    img_paths, keywords, pids = prepare_data2(df)
+    img_paths, names, pids, keywords = prepare_data(df)
     dataset_df = pd.DataFrame({
         'pids':pids,
         'img_paths':img_paths,
-        'keywords':keywords
+        'names':names,
+        'keywords': keywords
     })
     dataset_df=dataset_df.drop_duplicates().reset_index().drop(columns=['index'])
     #print(dataset_df)
@@ -272,7 +275,7 @@ def build_loader(dataframe, tokenizer, mode):
     
     dataset = CLIPDataset(
         img_paths=dataframe['img_paths'].values,
-        keywords=dataframe['keywords'].values,
+        keywords=dataframe['names'].values,
         tokenizer=tokenizer,
         transforms=transforms,
     )
@@ -291,7 +294,7 @@ def train_epoch(model, train_loader, optimizer, lr_scheduler,step):
     loss_meter=clip_helper.AvgMeter()
     tqdm_object = tqdm(train_loader, total=len(train_loader))
     for batch in tqdm_object:
-        batch = {k:v for k,v in batch.items() if k!='keywords'}
+        batch = {k:v for k,v in batch.items() if k!='names'}
         loss = model(batch)
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
@@ -410,6 +413,8 @@ def train(train_df, valid_df):
         
         lr_scheduler.step(valid_loss.avg)
 
+pc_client = PineconeClientAccess()
+
 def test(ds_df):
     _, img_embeddings, text_embeddings = get_image_embeddings(ds_df, 'model/best_og.pt')
     print(img_embeddings.shape)
@@ -417,18 +422,28 @@ def test(ds_df):
 
     df_img = pd.DataFrame({
         'id': ds_df['pids'],
-        'name':ds_df['keywords'],
+        'name':ds_df['names'],
         'img_path':ds_df['img_paths'],
         'img_embeddings':list(img_embeddings),
         'text_embeddings':list(text_embeddings)
     })
+
+    pc_client.upsert_namespace(
+        text_embeddings=list(text_embeddings), 
+        image_embeddings=list(img_embeddings),
+        pids=ds_df['pids'].tolist(),
+        metadata=ds_df['keywords'].tolist(),
+        namespace='ogCLIP'
+    )
+    pc_client.namespace_details(namespace='ogCLIP')
+
     df_img.to_csv('embeddings/clip_img_embedding.csv', encoding='utf-8', index=False)
 
 
 def main():
     ds_df, train_df, valid_df = make_train_dfs()
     print(ds_df)
-    #train(train_df, valid_df)
+    train(train_df, valid_df)
     test(ds_df)
     
 

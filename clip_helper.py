@@ -33,7 +33,7 @@ class CFG:
     projection_dim = 256 
     dropout = 0.1
 
-    model_lambda = 1e-4 # for mahalanobis models
+    model_lambda = 1e-3 # for mahalanobis models
 
 class AvgMeter:
     def __init__(self, name="Metric"):
